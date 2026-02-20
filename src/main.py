@@ -1,11 +1,6 @@
 """
-main.py
-Nifty Iron Condor Signal Bot — Main Runner
-
-Modes (set via ENV or CLI arg):
-  entry  → fetch chain, analyse, send entry signal (run at 9:25 AM)
-  exit   → check current premium, send exit if needed (run every 5 min)
-  test   → full dry run with console output only
+main.py - Fixed version
+Handles synthetic chain fallback properly.
 """
 
 import sys
@@ -15,24 +10,64 @@ import logging
 from datetime import datetime
 import pytz
 
-from nse_data import get_option_chain, get_vix, get_pcr
-from strategy import build_iron_condor
-from telegram_bot import (
-    send_entry_signal, send_skip_signal,
-    send_exit_signal, send_error, send_startup
-)
-
+# Setup logging first
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s"
 )
 log = logging.getLogger(__name__)
 
-IST = pytz.timezone("Asia/Kolkata")
+# ── Test Telegram FIRST before anything else ──────────────────────────────────
+def test_telegram():
+    """Quick test to verify Telegram credentials work."""
+    import requests
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    if not token:
+        log.error("TELEGRAM_BOT_TOKEN is not set!")
+        return False
+    if not chat_id:
+        log.error("TELEGRAM_CHAT_ID is not set!")
+        return False
+
+    log.info(f"Token starts with: {token[:10]}...")
+    log.info(f"Chat ID: {chat_id}")
+
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id"   : chat_id,
+                "text"      : "🤖 <b>Bot test ping — Telegram is working!</b>",
+                "parse_mode": "HTML"
+            },
+            timeout=15
+        )
+        result = resp.json()
+        log.info(f"Telegram response: {result}")
+        if result.get("ok"):
+            log.info("✅ Telegram working!")
+            return True
+        else:
+            log.error(f"Telegram error: {result.get('description')}")
+            return False
+    except Exception as e:
+        log.error(f"Telegram request failed: {e}")
+        return False
+
+
+from nse_data import get_option_chain, get_vix, get_pcr
+from strategy import build_iron_condor
+from telegram_bot import (
+    send_entry_signal, send_skip_signal,
+    send_exit_signal, send_error
+)
+
+IST           = pytz.timezone("Asia/Kolkata")
 POSITION_FILE = "/tmp/open_position.json"
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 def is_market_open() -> bool:
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -42,7 +77,7 @@ def is_market_open() -> bool:
     return start <= now <= end
 
 
-def save_position(sig):
+def save_position(sig, expiry):
     with open(POSITION_FILE, "w") as f:
         json.dump({
             "sell_ce_strike": sig.sell_ce_strike,
@@ -52,11 +87,11 @@ def save_position(sig):
             "net_premium"   : sig.net_premium,
             "target_exit"   : sig.target_exit,
             "stop_loss"     : sig.stop_loss,
-            "expiry"        : sig.expiry,
+            "expiry"        : expiry,
         }, f)
 
 
-def load_position() -> dict | None:
+def load_position():
     try:
         with open(POSITION_FILE) as f:
             return json.load(f)
@@ -71,16 +106,12 @@ def clear_position():
         pass
 
 
-def get_current_premium(chain: dict, pos: dict) -> float:
-    """Recalculate net premium from live option chain."""
-    strikes = chain["strikes"]
-
+def get_current_premium(chain, pos):
     def ltp(strike, side):
-        for s in strikes:
+        for s in chain["strikes"]:
             if s["strike"] == strike:
                 return s[f"{side}_ltp"]
         return 0.0
-
     sc = ltp(pos["sell_ce_strike"], "ce")
     bc = ltp(pos["buy_ce_strike"],  "ce")
     sp = ltp(pos["sell_pe_strike"], "pe")
@@ -88,107 +119,112 @@ def get_current_premium(chain: dict, pos: dict) -> float:
     return round((sc - bc) + (sp - bp), 2)
 
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
 def run_entry(dry_run=False):
     log.info("=== ENTRY MODE ===")
 
-    if not is_market_open() and not dry_run:
-        log.warning("Market is closed. Skipping.")
+    # Step 1: Test Telegram first
+    log.info("Step 1: Testing Telegram connection...")
+    tg_ok = test_telegram()
+    if not tg_ok:
+        log.error("Telegram not working — check your secrets!")
         return
 
-    log.info("Fetching NSE option chain…")
+    # Step 2: Fetch market data
+    log.info("Step 2: Fetching market data...")
     chain = get_option_chain()
-    if not chain:
-        send_error("Could not fetch NSE option chain. NSE may be down.")
+
+    if chain is None:
+        log.error("All data sources failed!")
+        send_error("All data sources failed. Cannot generate signal today.")
         return
 
-    vix = get_vix()
-    if vix is None:
-        vix = 13.0   # fallback estimate
-        log.warning("VIX fetch failed — using fallback 13.0")
+    source = chain.get("source", "unknown")
+    log.info(f"Data source: {source}, spot={chain['spot']}, strikes={len(chain['strikes'])}")
 
+    vix = get_vix() or 14.0
     pcr = get_pcr(chain["strikes"])
 
-    log.info(f"Spot={chain['spot']:.0f}  VIX={vix:.2f}  PCR={pcr:.2f}  Expiry={chain['expiry']}")
-    log.info(f"Strikes available: {len(chain['strikes'])}")
+    log.info(f"Spot={chain['spot']:.0f}  VIX={vix:.2f}  PCR={pcr:.2f}")
 
+    # Step 3: Build signal
+    log.info("Step 3: Building Iron Condor signal...")
     signal, skip_reason = build_iron_condor(chain, vix, pcr)
 
     if dry_run:
         if signal:
-            print("\n" + "="*50)
-            print("DRY RUN — SIGNAL WOULD BE SENT:")
-            print(f"  Sell CE: {signal.sell_ce_strike} @ ₹{signal.sell_ce_prem}")
-            print(f"  Buy  CE: {signal.buy_ce_strike}  @ ₹{signal.buy_ce_prem}")
-            print(f"  Sell PE: {signal.sell_pe_strike} @ ₹{signal.sell_pe_prem}")
-            print(f"  Buy  PE: {signal.buy_pe_strike}  @ ₹{signal.buy_pe_prem}")
+            print(f"\n{'='*50}")
+            print("DRY RUN — Signal details:")
+            print(f"  Source      : {source}")
+            print(f"  Spot        : {chain['spot']}")
+            print(f"  VIX         : {vix}")
+            print(f"  Sell CE     : {signal.sell_ce_strike} @ ₹{signal.sell_ce_prem}")
+            print(f"  Buy  CE     : {signal.buy_ce_strike}  @ ₹{signal.buy_ce_prem}")
+            print(f"  Sell PE     : {signal.sell_pe_strike} @ ₹{signal.sell_pe_prem}")
+            print(f"  Buy  PE     : {signal.buy_pe_strike}  @ ₹{signal.buy_pe_prem}")
             print(f"  Net Premium : ₹{signal.net_premium}")
             print(f"  Grade       : {signal.signal_grade} ({signal.signal_score}/100)")
-            print(f"  Max Profit  : ₹{signal.max_profit}")
-            print(f"  Max Loss    : ₹{signal.max_loss}")
-            print("="*50)
+            print(f"{'='*50}")
         else:
-            print(f"\nDRY RUN — NO SIGNAL: {skip_reason}")
+            print(f"\nDRY RUN — No signal: {skip_reason}")
         return
 
+    # Step 4: Send signal
+    log.info("Step 4: Sending Telegram signal...")
     if signal:
-        log.info(f"Signal Grade={signal.signal_grade} Score={signal.signal_score} Premium=₹{signal.net_premium}")
+        # Add synthetic warning to signal if needed
+        signal.is_synthetic = (source == "synthetic")
         send_entry_signal(signal)
-        save_position(signal)
+        save_position(signal, chain["expiry"])
+        log.info("Entry signal sent!")
     else:
-        log.info(f"No signal: {skip_reason}")
+        log.info(f"No signal today: {skip_reason}")
         send_skip_signal(skip_reason, chain["spot"], vix)
 
 
-# ── Exit Monitor ───────────────────────────────────────────────────────────────
 def run_exit():
     log.info("=== EXIT CHECK ===")
-
     pos = load_position()
     if not pos:
-        log.info("No open position to monitor.")
+        log.info("No open position.")
         return
 
-    if not is_market_open():
-        log.warning("Market closed.")
+    chain = get_option_chain()
+    if not chain:
         return
 
     now = datetime.now(IST)
     force_exit = now >= now.replace(hour=15, minute=15, second=0, microsecond=0)
-
-    chain = get_option_chain()
-    if not chain:
-        log.error("Could not fetch chain for exit check.")
-        return
-
     current_premium = get_current_premium(chain, pos)
-    log.info(f"Current premium: ₹{current_premium}  Target: ₹{pos['target_exit']}  SL: ₹{pos['stop_loss']}")
+    log.info(f"Premium now: ₹{current_premium} | Target: ₹{pos['target_exit']} | SL: ₹{pos['stop_loss']}")
 
     exit_reason = None
-
     if force_exit:
         exit_reason = "⏰ Time-based exit (3:15 PM)"
     elif current_premium <= pos["target_exit"]:
-        exit_reason = f"🎯 Target hit — premium decayed to ₹{current_premium}"
+        exit_reason = f"🎯 Target hit — premium at ₹{current_premium}"
     elif current_premium >= pos["stop_loss"]:
-        exit_reason = f"🛑 Stop Loss hit — premium rose to ₹{current_premium}"
+        exit_reason = f"🛑 Stop Loss hit — premium at ₹{current_premium}"
 
     if exit_reason:
-        # Build a minimal signal-like object for the message
         class _Sig:
             pass
         sig = _Sig()
         for k, v in pos.items():
             setattr(sig, k, v)
-
         send_exit_signal(sig, current_premium, exit_reason)
         clear_position()
-        log.info(f"Exit signal sent: {exit_reason}")
+
+
+def run_telegram_test():
+    """Just test Telegram — nothing else."""
+    log.info("=== TELEGRAM TEST ===")
+    ok = test_telegram()
+    if ok:
+        log.info("✅ Telegram works! Check your chat for the test message.")
     else:
-        log.info("Holding position — no exit condition met.")
+        log.error("❌ Telegram failed. Check your BOT_TOKEN and CHAT_ID secrets.")
 
 
-# ── Main ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "entry"
 
@@ -197,8 +233,9 @@ if __name__ == "__main__":
     elif mode == "exit":
         run_exit()
     elif mode == "test":
-        log.info("Running in DRY RUN / TEST mode…")
         run_entry(dry_run=True)
+    elif mode == "tgtest":
+        run_telegram_test()
     else:
-        print(f"Unknown mode: {mode}. Use: entry | exit | test")
+        print(f"Unknown mode: {mode}. Use: entry | exit | test | tgtest")
         sys.exit(1)
