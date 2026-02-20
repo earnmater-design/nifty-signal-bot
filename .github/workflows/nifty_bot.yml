@@ -1,66 +1,46 @@
-# .github/workflows/nifty_bot.yml
-# ─────────────────────────────────────────────────────────────
-#  FREE hosting via GitHub Actions
-#  Runs entry signal at 9:25 AM IST (= 3:55 AM UTC)
-#  Runs exit checks every 5 min from 9:30 AM to 3:20 PM IST
-# ─────────────────────────────────────────────────────────────
-
 name: Nifty Iron Condor Signal Bot
 
 on:
   schedule:
-    # ── Entry signal ──────────────────────────────────────────
-    # 9:25 AM IST = 03:55 AM UTC  (Mon–Fri only)
     - cron: '55 3 * * 1-5'
-
-    # ── Exit checks every 5 min from 9:30 to 15:15 IST ───────
-    # 9:30  IST = 04:00 UTC
     - cron: '0 4 * * 1-5'
-    - cron: '5 4 * * 1-5'
     - cron: '10 4 * * 1-5'
-    - cron: '15 4 * * 1-5'
     - cron: '20 4 * * 1-5'
-    - cron: '25 4 * * 1-5'
     - cron: '30 4 * * 1-5'
-    - cron: '35 4 * * 1-5'
     - cron: '40 4 * * 1-5'
-    - cron: '45 4 * * 1-5'
     - cron: '50 4 * * 1-5'
-    - cron: '55 4 * * 1-5'
     - cron: '0 5 * * 1-5'
-    - cron: '5 5 * * 1-5'
     - cron: '10 5 * * 1-5'
-    - cron: '15 5 * * 1-5'
     - cron: '20 5 * * 1-5'
-    - cron: '25 5 * * 1-5'
     - cron: '30 5 * * 1-5'
-    - cron: '35 5 * * 1-5'
     - cron: '40 5 * * 1-5'
-    - cron: '45 5 * * 1-5'
     - cron: '50 5 * * 1-5'
-    - cron: '55 5 * * 1-5'
     - cron: '0 6 * * 1-5'
-    - cron: '5 6 * * 1-5'
     - cron: '10 6 * * 1-5'
-    - cron: '15 6 * * 1-5'
     - cron: '20 6 * * 1-5'
-    - cron: '25 6 * * 1-5'
     - cron: '30 6 * * 1-5'
-    - cron: '35 6 * * 1-5'
     - cron: '40 6 * * 1-5'
-    - cron: '45 6 * * 1-5'
-    # 3:15 PM IST = 09:45 UTC  (final force exit)
+    - cron: '50 6 * * 1-5'
+    - cron: '0 7 * * 1-5'
+    - cron: '10 7 * * 1-5'
+    - cron: '20 7 * * 1-5'
+    - cron: '30 7 * * 1-5'
+    - cron: '40 7 * * 1-5'
     - cron: '45 9 * * 1-5'
 
-  # Allow manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       mode:
         description: 'Run mode'
         required: true
-        default: 'entry'
+        default: 'debug'
         type: choice
-        options: [entry, exit, test]
+        options:
+          - entry
+          - exit
+          - test
+          - tgtest
+          - debug
 
 jobs:
   run-bot:
@@ -83,14 +63,13 @@ jobs:
       - name: Determine run mode
         id: mode
         run: |
-          # 9:25 AM IST = 03:55 UTC → entry mode
-          # All other times → exit mode
           HOUR=$(date -u +%H)
           MIN=$(date -u +%M)
-          if [ "$HOUR" = "03" ] && [ "$MIN" = "55" ]; then
+          INPUT_MODE="${{ github.event.inputs.mode }}"
+          if [ "$INPUT_MODE" != "" ]; then
+            echo "mode=$INPUT_MODE" >> $GITHUB_OUTPUT
+          elif [ "$HOUR" = "03" ] && [ "$MIN" = "55" ]; then
             echo "mode=entry" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.inputs.mode }}" != "" ]; then
-            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
           else
             echo "mode=exit" >> $GITHUB_OUTPUT
           fi
@@ -100,4 +79,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         working-directory: src
-        run: python main.py ${{ steps.mode.outputs.mode }}
+        run: |
+          MODE="${{ steps.mode.outputs.mode }}"
+          echo "Running in mode: $MODE"
+          if [ "$MODE" = "debug" ]; then
+            python debug.py
+          else
+            python main.py $MODE
+          fi
